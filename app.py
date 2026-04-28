@@ -1,7 +1,124 @@
 import streamlit as st
 import pandas as pd
 import io
+import os
 from datetime import datetime
+
+# SendGrid — only imported if API key is configured
+def send_digest_email(to_email: str, subject: str, html_body: str) -> tuple[bool, str]:
+    """Send HTML email via SendGrid. Returns (success, message)."""
+    try:
+        import sendgrid
+        from sendgrid.helpers.mail import Mail, Email, To, Content
+    except ImportError:
+        return False, "sendgrid library not installed"
+
+    api_key = st.secrets.get("SENDGRID_API_KEY", os.environ.get("SENDGRID_API_KEY", ""))
+    from_email = st.secrets.get("SENDGRID_FROM_EMAIL", os.environ.get("SENDGRID_FROM_EMAIL", ""))
+
+    if not api_key or not from_email:
+        return False, "SendGrid not configured — add SENDGRID_API_KEY and SENDGRID_FROM_EMAIL to Streamlit secrets"
+
+    try:
+        sg = sendgrid.SendGridAPIClient(api_key=api_key)
+        message = Mail(
+            from_email=Email(from_email, "Biotech VC Digest"),
+            to_emails=To(to_email),
+            subject=subject,
+            html_content=Content("text/html", html_body)
+        )
+        response = sg.client.mail.send.post(request_body=message.get())
+        if response.status_code in (200, 202):
+            return True, f"Digest sent to {to_email}"
+        else:
+            return False, f"SendGrid error: status {response.status_code}"
+    except Exception as e:
+        return False, f"Send failed: {str(e)}"
+
+
+def build_email_html(deals: list, date_str: str) -> str:
+    """Build a clean HTML email version of the digest."""
+    total_capital = sum(d["deal_size_raw"] for d in deals)
+    onc_count = sum(1 for d in deals if d["is_onc"])
+    total_fmt = f"${total_capital:.1f}M" if total_capital < 1000 else f"${total_capital/1000:.1f}B"
+
+    def epill(text, bg, fg):
+        return f'<span style="font-size:11px;padding:2px 7px;border-radius:20px;background:{bg};color:{fg};margin-right:4px;">{text}</span>'
+
+    def deal_epills(d):
+        t = ""
+        if d["is_onc"]:   t += epill("Oncology", "#FCEBEB", "#791F1F")
+        if d["is_accel"]: t += epill(f"Accelerator ({d['accel_name']})" if d["accel_name"] else "Accelerator", "#E1F5EE", "#085041")
+        else:             t += epill("Angel", "#EEEDFE", "#3C3289")
+        if d["geo"]:      t += epill(d["geo"], "#F1F5F9", "#475569")
+        if d["biz_status"]: t += epill(d["biz_status"], "#E6F1FB", "#0C447C")
+        return t
+
+    leaderboard = ""
+    for i, d in enumerate(deals, 1):
+        synopsis = (d["synopsis"][:220] + "…") if len(d["synopsis"]) > 220 else d["synopsis"]
+        leaderboard += f"""
+        <tr><td style="padding:12px 0;border-bottom:1px solid #eee;vertical-align:top;">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+            <div>
+              <span style="font-size:12px;color:#94A3B8;margin-right:6px;">{i}</span>
+              <span style="font-weight:600;font-size:14px;color:#0D1B2A;">{d['company']}</span>
+              <div style="margin-top:5px;">{deal_epills(d)}</div>
+            </div>
+            <div style="font-weight:600;font-size:14px;color:#0D1B2A;white-space:nowrap;padding-left:12px;">{d['deal_size']}</div>
+          </div>
+          <div style="font-size:12px;color:#475569;line-height:1.6;margin-top:6px;">{synopsis}</div>
+        </td></tr>"""
+
+    onc_cards = ""
+    for d in [x for x in deals if x["is_onc"]]:
+        full = (d["synopsis"][:400] + "…") if len(d["synopsis"]) > 400 else d["synopsis"]
+        onc_cards += f"""
+        <div style="border:1px solid #FECACA;border-left:4px solid #DC2626;border-radius:8px;padding:14px;margin-bottom:10px;">
+          <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+            <span style="font-weight:600;font-size:14px;color:#0D1B2A;">{d['company']}</span>
+            <span style="font-size:12px;color:#64748B;">{'Accelerator' if d['is_accel'] else 'Angel'} · {d['geo']}</span>
+          </div>
+          <div style="margin-bottom:7px;">
+            {epill('Oncology','#FCEBEB','#791F1F')}
+            {epill(d['modality'],'#E6F1FB','#0C447C')}
+          </div>
+          <div style="font-size:12px;color:#475569;line-height:1.6;">{full}</div>
+        </div>"""
+
+    mod_counts = {}
+    for d in deals:
+        mod_counts[d["modality"]] = mod_counts.get(d["modality"], 0) + 1
+    mod_rows = ""
+    for m, c in sorted(mod_counts.items(), key=lambda x: -x[1]):
+        pct = round(c / len(deals) * 100)
+        mod_rows += f'<tr><td style="padding:6px 8px;font-size:12px;border-bottom:1px solid #eee;">{m}</td><td style="padding:6px 8px;text-align:right;font-size:12px;border-bottom:1px solid #eee;">{c}</td><td style="padding:6px 8px;border-bottom:1px solid #eee;"><div style="background:#534AB7;height:6px;border-radius:3px;width:{pct*1.2}px;display:inline-block;"></div> <span style="font-size:10px;color:#94A3B8;">{pct}%</span></td></tr>'
+
+    return f"""<!DOCTYPE html><html><body>
+<div style="font-family:system-ui,sans-serif;max-width:640px;margin:0 auto;color:#111;">
+  <div style="padding:24px 0 16px;border-bottom:2px solid #0D1B2A;">
+    <div style="font-size:10px;letter-spacing:1px;text-transform:uppercase;color:#666;margin-bottom:4px;">Bi-weekly digest · PitchBook</div>
+    <h1 style="font-size:22px;font-weight:700;margin:0;color:#0D1B2A;">Biotech Early-Stage Funding</h1>
+    <div style="font-size:13px;color:#666;margin-top:4px;">{date_str} · {len(deals)} deals · Angel + Accelerator · Oncology focus</div>
+  </div>
+  <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:20px 0;">
+    <div style="background:#f5f5f3;border-radius:8px;padding:12px;"><div style="font-size:10px;color:#666;margin-bottom:3px;">Total capital</div><div style="font-size:20px;font-weight:700;">{total_fmt}</div></div>
+    <div style="background:#f5f5f3;border-radius:8px;padding:12px;"><div style="font-size:10px;color:#666;margin-bottom:3px;">Total deals</div><div style="font-size:20px;font-weight:700;">{len(deals)}</div></div>
+    <div style="background:#FCEBEB;border-radius:8px;padding:12px;"><div style="font-size:10px;color:#791F1F;margin-bottom:3px;">Oncology</div><div style="font-size:20px;font-weight:700;color:#791F1F;">{onc_count}</div></div>
+  </div>
+  <div style="font-size:10px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#94A3B8;margin-bottom:8px;">Deal leaderboard</div>
+  <table style="width:100%;border-collapse:collapse;">{leaderboard}</table>
+  <div style="font-size:10px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#791F1F;margin:20px 0 8px;">Oncology spotlight</div>
+  {onc_cards if onc_cards else '<p style="font-size:13px;color:#888;">No oncology-tagged deals in this batch.</p>'}
+  <div style="font-size:10px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#534AB7;margin:20px 0 8px;">Platform modality</div>
+  <table style="width:100%;border-collapse:collapse;font-size:12px;">
+    <tr style="background:#f5f5f3;"><td style="padding:6px 8px;font-weight:600;">Modality</td><td style="padding:6px 8px;font-weight:600;text-align:right;">Deals</td><td style="padding:6px 8px;font-weight:600;">Share</td></tr>
+    {mod_rows}
+  </table>
+  <div style="margin-top:28px;padding-top:14px;border-top:1px solid #eee;font-size:10px;color:#94A3B8;">
+    Compiled by Biotech Early-Stage Digest · Powered by Claude · Source: PitchBook · {date_str}
+  </div>
+</div></body></html>"""
 
 # ─── PAGE CONFIG ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -386,6 +503,40 @@ with col_ta:
     for d in deals:
         ta_counts[d["ta"]] = ta_counts.get(d["ta"], 0) + 1
     st.markdown(bar_chart(ta_counts, "bar-fill-ta"), unsafe_allow_html=True)
+
+# ── EMAIL SEND ──
+st.markdown("---")
+st.markdown('<div class="section-title">Send digest to email</div>', unsafe_allow_html=True)
+
+col_email, col_btn = st.columns([3, 1])
+with col_email:
+    recipient = st.text_input(
+        "Email address",
+        placeholder="professor@hbs.edu",
+        label_visibility="collapsed"
+    )
+with col_btn:
+    send_clicked = st.button("Send digest", use_container_width=True, type="primary")
+
+if send_clicked:
+    if not recipient or "@" not in recipient:
+        st.warning("Please enter a valid email address.")
+    else:
+        with st.spinner(f"Sending digest to {recipient}..."):
+            html_email = build_email_html(deals, date_str)
+            subject = f"Biotech Early-Stage Funding Digest — {date_str}"
+            ok, msg = send_digest_email(recipient, subject, html_email)
+        if ok:
+            st.success(f"Sent! {msg}")
+        else:
+            st.error(f"Send failed: {msg}")
+            if "not configured" in msg:
+                st.info("""**To enable email sending, add these to Streamlit Cloud Secrets:**
+```
+SENDGRID_API_KEY = "SG.your-key-here"
+SENDGRID_FROM_EMAIL = "your-verified-email@gmail.com"
+```
+See DEPLOY.md for full setup instructions.""")
 
 # ── FOOTER ──
 st.markdown(f"""
